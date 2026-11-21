@@ -1,0 +1,347 @@
+From 09799fe034acd4d1aa9b20dc26114f66b5af12bf Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9005-adaptive-stop-ends-downloads@localhost>
+From: Cobi Player <build@localhost>
+Date: Wed, 18 Nov 2026 23:24:28 +0100
+Subject: [PATCH] demux: adaptive: stopping ends the downloads instead of
+ waiting for the network
+
+Stopping an HLS or DASH stream waited as long as the download in progress
+did. Close calls PlaylistManager::stop, which takes the playlist lock and
+joins the manager thread (vlc-adapt-mngr). That thread holds the lock for
+its whole loop, letting go only in its waits, and is mostly inside the
+inner demuxer, reading the current segment: HTTPChunkBufferedSource waits
+for the downloader thread (vlc-adapt-dl), which waits in a network read.
+Neither thread has an interrupt context, so nothing ends that read, and
+stop() cannot even take the lock. The stop lasts as long as the server
+takes to send the rest of the segment, and for good when the server or the
+network stalls on an open connection. HTTP/1.1 and HTTP/2 alike; playlist
+reloads and keys (the high-priority downloader) the same.
+
+Seen in Cobi Player on Android: stops of the Mux test stream (HLS over
+HTTP/2) took a median 104 ms, but 2 of 116 took 1.5 and 5.3 s and 10 never
+returned within the app's 10 s give-up. Reproduced with a local HLS server
+whose second segment stalls after 120000 bytes: no stop returned, with the
+input thread in PlaylistManager::stop's vlc_mutex_lock, the manager in
+HTTPChunkBufferedSource's wait and the downloader in vlc_tls_Read's poll.
+All the stuck stops returned the moment the server's sockets closed.
+
+- Each Downloader gets its own interrupt context. Downloader::kill() (the
+  destructor's, now public) also kills it, which ends a read or a connect
+  in progress: vlc_tls_Read, the socket connect and the TLS handshake check
+  vlc_killed(), and an HTTP/2 stream wait is woken.
+- A kill wakes only one wait: an HTTP/2 read that finds a frame queued
+  uses it up without waiting, and the next read would wait on the network
+  again. LibVLCHTTPSource checks vlc_killed() before every read, and
+  LibVLCHTTPConnection before every request (a redirect after a request
+  the kill did not end).
+- src/network/getaddrinfo.c: the stand-in vlc_getaddrinfo_i11e (Android,
+  Apple, Windows, OS/2) no longer starts a lookup in a killed thread. The
+  HTTP connection manager drops a reused connection whose request failed
+  and opens a new one, which would wait for the resolver before its
+  connect sees the kill. A lookup already in progress still cannot be
+  interrupted there: a stop during one waits for the resolver (its cache
+  at once; its time-out on a dead network).
+- A killed Downloader ends what is still queued, and whatever is scheduled
+  later, without downloading it (HTTPChunkBufferedSource::abort: done,
+  reader woken), so no reader waits for a download that never comes.
+- PlaylistManager::stop sets b_canceled and kills both downloaders (the new
+  AbstractConnectionManager::abortDownloads()) before it takes the lock.
+  b_canceled becomes atomic: stop() sets it without the lock, and the
+  thread, which may loop on under the lock while every download now ends
+  at once (Lessthanmin), sees it at its loop's top.
+- A debug line ("stopping: ending the downloads in progress") marks the
+  stop in the log and lets Cobi Player's package check see the patch in
+  the build.
+
+Nothing changes before Close. Not upstream: VLC master (2e9a78d148,
+18.11.2026) has the same Downloader and PlaylistManager::stop.
+---
+ modules/demux/adaptive/PlaylistManager.cpp    |  8 ++++-
+ modules/demux/adaptive/PlaylistManager.h      |  5 +++-
+ modules/demux/adaptive/http/Chunk.cpp         |  8 +++++
+ modules/demux/adaptive/http/Chunk.h           |  1 +
+ modules/demux/adaptive/http/Downloader.cpp    | 29 +++++++++++++++++--
+ modules/demux/adaptive/http/Downloader.hpp    |  7 ++++-
+ .../demux/adaptive/http/HTTPConnection.cpp    |  9 ++++--
+ .../adaptive/http/HTTPConnectionManager.cpp   |  8 +++++
+ .../adaptive/http/HTTPConnectionManager.h     |  3 ++
+ src/network/getaddrinfo.c                     |  7 +++++
+ 10 files changed, 77 insertions(+), 8 deletions(-)
+
+diff --git a/modules/demux/adaptive/PlaylistManager.cpp b/modules/demux/adaptive/PlaylistManager.cpp
+index 91325ca540..acbf99cf8b 100644
+--- a/modules/demux/adaptive/PlaylistManager.cpp
++++ b/modules/demux/adaptive/PlaylistManager.cpp
+@@ -189,9 +189,15 @@ void PlaylistManager::stop()
+     if(!b_thread)
+         return;
+ 
++    /* The thread holds the lock while it reads a segment or a playlist, and
++     * the read waits for the download, which waits for the network: tell
++     * the thread to stop and end the downloads before taking the lock. */
++    b_canceled = true;
++    msg_Dbg(p_demux, "stopping: ending the downloads in progress");
++    resources->getConnManager()->abortDownloads();
++
+     {
+         mutex_locker locker {lock};
+-        b_canceled = true;
+         waitcond.signal();
+     }
+ 
+diff --git a/modules/demux/adaptive/PlaylistManager.h b/modules/demux/adaptive/PlaylistManager.h
+index c3d7f7513f..8f0036cff6 100644
+--- a/modules/demux/adaptive/PlaylistManager.h
++++ b/modules/demux/adaptive/PlaylistManager.h
+@@ -26,6 +26,7 @@
+ #include "tools/Macros.hpp"
+ #include "Streams.hpp"
+ #include <vector>
++#include <atomic>
+ 
+ #include <vlc_threads.h>
+ #include <vlc_cxx_helpers.hpp>
+@@ -158,7 +159,9 @@ namespace adaptive
+             vlc_thread_t thread;
+             bool         b_thread;
+             bool         b_buffering;
+-            bool         b_canceled;
++            /* Read without the lock by stop(): the thread holds the lock
++             * while it reads, and loops on without letting it go. */
++            std::atomic<bool> b_canceled;
+             vlc_tick_t   pause_start;
+     };
+ 
+diff --git a/modules/demux/adaptive/http/Chunk.cpp b/modules/demux/adaptive/http/Chunk.cpp
+index 8ad908434a..18cc45c045 100644
+--- a/modules/demux/adaptive/http/Chunk.cpp
++++ b/modules/demux/adaptive/http/Chunk.cpp
+@@ -386,6 +386,14 @@ void HTTPChunkBufferedSource::release()
+     avail.signal();
+ }
+ 
++void HTTPChunkBufferedSource::abort()
++{
++    /* Never downloaded: its reader gets the end at once. */
++    mutex_locker locker {lock};
++    done = true;
++    avail.signal();
++}
++
+ void HTTPChunkBufferedSource::bufferize(size_t readsize)
+ {
+     {
+diff --git a/modules/demux/adaptive/http/Chunk.h b/modules/demux/adaptive/http/Chunk.h
+index f381efae7b..346cb1c735 100644
+--- a/modules/demux/adaptive/http/Chunk.h
++++ b/modules/demux/adaptive/http/Chunk.h
+@@ -180,6 +180,7 @@ namespace adaptive
+                 bool               isDone() const;
+                 void               hold();
+                 void               release();
++                void               abort();
+ 
+             private:
+                 block_t            *p_head; /* read cache buffer */
+diff --git a/modules/demux/adaptive/http/Downloader.cpp b/modules/demux/adaptive/http/Downloader.cpp
+index b5e7a178d7..c14f007638 100644
+--- a/modules/demux/adaptive/http/Downloader.cpp
++++ b/modules/demux/adaptive/http/Downloader.cpp
+@@ -35,6 +35,7 @@ Downloader::Downloader()
+     thread_handle_valid = false;
+     current = nullptr;
+     cancel_current = false;
++    interrupt = vlc_interrupt_create();
+ }
+ 
+ bool Downloader::start()
+@@ -54,18 +55,31 @@ Downloader::~Downloader()
+ 
+     if(thread_handle_valid)
+         vlc_join(thread_handle, nullptr);
++    if(interrupt)
++        vlc_interrupt_destroy(interrupt);
+ }
+ 
+ void Downloader::kill()
+ {
+-    vlc::threads::mutex_locker locker {lock};
+-    killed = true;
+-    wait_cond.signal();
++    {
++        vlc::threads::mutex_locker locker {lock};
++        killed = true;
++        wait_cond.signal();
++    }
++    /* A read waits for the network: for good on a stalled server, and the
++     * demux's Close (PlaylistManager::stop) waits for that read. */
++    if(interrupt)
++        vlc_interrupt_kill(interrupt);
+ }
+ 
+ void Downloader::schedule(HTTPChunkBufferedSource *source)
+ {
+     vlc::threads::mutex_locker locker {lock};
++    if(killed)
++    {
++        source->abort();
++        return;
++    }
+     source->hold();
+     chunks.push_back(source);
+     wait_cond.signal();
+@@ -91,6 +105,7 @@ void * Downloader::downloaderThread(void *opaque)
+ {
+     vlc_thread_set_name("vlc-adapt-dl");
+     Downloader *instance = static_cast<Downloader *>(opaque);
++    vlc_interrupt_set(instance->interrupt);
+     instance->Run();
+     return nullptr;
+ }
+@@ -106,6 +121,14 @@ void Downloader::Run()
+ 
+         if(killed)
+         {
++            /* Nothing more is downloaded: end what is queued, or its
++             * reader waits for good. */
++            for(HTTPChunkBufferedSource *chunk : chunks)
++            {
++                chunk->abort();
++                chunk->release();
++            }
++            chunks.clear();
+             lock.unlock();
+             break;
+         }
+diff --git a/modules/demux/adaptive/http/Downloader.hpp b/modules/demux/adaptive/http/Downloader.hpp
+index 873fc67243..01131af2d5 100644
+--- a/modules/demux/adaptive/http/Downloader.hpp
++++ b/modules/demux/adaptive/http/Downloader.hpp
+@@ -24,6 +24,7 @@
+ 
+ #include <vlc_common.h>
+ #include <vlc_threads.h>
++#include <vlc_interrupt.h>
+ #include <vlc_cxx_helpers.hpp>
+ #include <list>
+ 
+@@ -44,12 +45,16 @@ namespace adaptive
+                 bool start();
+                 void schedule(HTTPChunkBufferedSource *);
+                 void cancel(HTTPChunkBufferedSource *);
++                /* Ends the download in progress and every queued or later one,
++                 * for good: the demux is closing. */
++                void kill();
+ 
+             private:
+                 static void * downloaderThread(void *);
+                 void Run();
+-                void kill();
+                 vlc_thread_t thread_handle;
++                /* The thread's: kill() ends a network read with it. */
++                vlc_interrupt_t *interrupt;
+                 vlc::threads::mutex lock;
+                 vlc::threads::condition_variable wait_cond;
+                 vlc::threads::condition_variable updated_cond;
+diff --git a/modules/demux/adaptive/http/HTTPConnection.cpp b/modules/demux/adaptive/http/HTTPConnection.cpp
+index 41b4683695..5b6d7bb1a9 100644
+--- a/modules/demux/adaptive/http/HTTPConnection.cpp
++++ b/modules/demux/adaptive/http/HTTPConnection.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include <vlc_stream.h>
+ #include <vlc_keystore.h>
++#include <vlc_interrupt.h>
+ 
+ extern "C"
+ {
+@@ -103,7 +104,10 @@ class adaptive::http::LibVLCHTTPSource : public adaptive::BlockStreamInterface
+         }
+         block_t *readNextBlock() override
+         {
+-            if(http_res == nullptr)
++            /* A kill interrupts one wait only, and an HTTP/2 read that finds
++             * a frame queued uses it up without waiting: the next read would
++             * wait for the network again. Checked before every read. */
++            if(http_res == nullptr || vlc_killed())
+                 return nullptr;
+             block_t *b = vlc_http_res_read(http_res);
+             if(b == vlc_http_error)
+@@ -403,7 +407,8 @@ bool LibVLCHTTPConnection::canReuse(const ConnectionParams &params_) const
+ RequestStatus LibVLCHTTPConnection::request(const std::string &path,
+                                             const BytesRange &range)
+ {
+-    if(!source->isInitialized())
++    /* The same for a request after one the kill did not end (a redirect). */
++    if(!source->isInitialized() || vlc_killed())
+         return RequestStatus::GenericError;
+ 
+     reset();
+diff --git a/modules/demux/adaptive/http/HTTPConnectionManager.cpp b/modules/demux/adaptive/http/HTTPConnectionManager.cpp
+index ad6e7016ab..2bd2b887d5 100644
+--- a/modules/demux/adaptive/http/HTTPConnectionManager.cpp
++++ b/modules/demux/adaptive/http/HTTPConnectionManager.cpp
+@@ -260,6 +260,14 @@ void HTTPConnectionManager::start(AbstractChunkSource *source)
+         getDownloadQueue(src)->schedule(src);
+ }
+ 
++void HTTPConnectionManager::abortDownloads()
++{
++    if(downloader)
++        downloader->kill();
++    if(downloaderhp)
++        downloaderhp->kill();
++}
++
+ void HTTPConnectionManager::cancel(AbstractChunkSource *source)
+ {
+     HTTPChunkBufferedSource *src = dynamic_cast<HTTPChunkBufferedSource *>(source);
+diff --git a/modules/demux/adaptive/http/HTTPConnectionManager.h b/modules/demux/adaptive/http/HTTPConnectionManager.h
+index 02c90b70e3..37f8f63017 100644
+--- a/modules/demux/adaptive/http/HTTPConnectionManager.h
++++ b/modules/demux/adaptive/http/HTTPConnectionManager.h
+@@ -64,6 +64,8 @@ namespace adaptive
+ 
+                 virtual void start(AbstractChunkSource *) = 0;
+                 virtual void cancel(AbstractChunkSource *) = 0;
++                /* Ends every download, for good (Close). */
++                virtual void abortDownloads() {}
+ 
+                 virtual void updateDownloadRate(const ID &, size_t,
+                                                 vlc_tick_t, vlc_tick_t) override;
+@@ -92,6 +94,7 @@ namespace adaptive
+ 
+                 void start(AbstractChunkSource *)  override;
+                 void cancel(AbstractChunkSource *)  override;
++                void abortDownloads()  override;
+                 void         setLocalConnectionsAllowed();
+                 void         addFactory(AbstractConnectionFactory *);
+ 
+diff --git a/src/network/getaddrinfo.c b/src/network/getaddrinfo.c
+index 3b0d75d6a2..46659557d8 100644
+--- a/src/network/getaddrinfo.c
++++ b/src/network/getaddrinfo.c
+@@ -35,6 +35,7 @@
+ 
+ #include <sys/types.h>
+ #include <vlc_network.h>
++#include <vlc_interrupt.h>
+ 
+ int vlc_getnameinfo( const struct sockaddr *sa, int salen,
+                      char *host, int hostlen, int *portnum, int flags )
+@@ -113,6 +114,12 @@ int vlc_getaddrinfo (const char *node, unsigned port,
+ int vlc_getaddrinfo_i11e(const char *node, unsigned port,
+                          const struct addrinfo *hints, struct addrinfo **res)
+ {
++    /* A lookup in progress cannot be interrupted here, but a killed thread
++     * does not start one: a connection retried after a kill (connmgr.c drops
++     * a reused connection whose request failed, then opens a new one) would
++     * wait for the resolver before its connect sees the kill. */
++    if (vlc_killed())
++        return EAI_AGAIN;
+     return vlc_getaddrinfo(node, port, hints, res);
+ }
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

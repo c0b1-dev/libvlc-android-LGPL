@@ -1,0 +1,27 @@
+VideoHelper: a closed video window resets the place
+
+IVLCVout's contract: a display of 0x0 means the video window closed. libVLC 4's Android display
+(modules/video_output/android/display.c, Close) sends the last place along with it, and
+VideoHelper kept that place, so the video SurfaceView stayed pinned to the old size. Where libVLC
+places the picture itself (ASurfaceControl, Android 10 and later), nothing sizes the surface
+again: once a stream changed its format (an HLS variant switch closes the video output), turning
+the phone left the picture at the portrait size. Measured on the emulator, 10.11.2026.
+
+Upstream (VLC and libvlcjni master, 10.11.2026) still has both halves. Drop this patch once
+libvlcjni's VideoHelper honours a 0x0 display itself.
+
+--- a/libvlc/src/main/java/org/videolan/libvlc/VideoHelper.java
++++ b/libvlc/src/main/java/org/videolan/libvlc/VideoHelper.java
+@@ -271,6 +271,12 @@
+     @Override
+     public void onNewVideoLayout(IVLCVout vlcVout, int displayWidth, int displayHeight,
+                                  int placeWidth, int placeHeight, int placeX, int placeY) {
++        /* A display of 0x0 means the video window closed (IVLCVout's contract), but libVLC 4
++         * sends the last place along with it. Kept, that place pinned the surface to the old
++         * size, and where libVLC places the picture itself (ASurfaceControl) nothing sized it
++         * again: after a stream's format changed, turning the phone left the picture small. */
++        if (displayWidth == 0 || displayHeight == 0)
++            placeWidth = placeHeight = placeX = placeY = 0;
+         mPlaceWidth = placeWidth;
+         mPlaceHeight = placeHeight;
+         mPlaceX = placeX;

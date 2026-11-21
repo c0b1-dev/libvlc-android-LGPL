@@ -1,0 +1,80 @@
+From 6910a99f8f314c9558852995c0839a2fab67ad07 Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9001-android-display-close-asc@localhost>
+From: Cobi Player <build@localhost>
+Date: Tue, 10 Nov 2026 02:07:58 +0100
+Subject: [PATCH] android: display: remove the surface control from the tree
+ when closing
+
+ASurfaceControl_release() only drops the handle: the surface and its last
+buffer stay on screen as long as the parent surface does. Each closed
+display left its last picture in the SurfaceView, under the next one; once
+the place changed (a rotation after a format change), a frozen strip of the
+old picture showed beside the new one.
+
+Reparent the control to NULL before releasing it, as the NDK documents for
+removing a surface from the display.
+---
+ modules/video_output/android/display.c | 11 +++++++++++
+ modules/video_output/android/utils.c   |  1 +
+ modules/video_output/android/utils.h   |  4 ++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index ca50379..56fd26e 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -633,6 +633,17 @@ static void Close(vout_display_t *vd)
+ 
+         if (sys->asc.previous_picture != NULL)
+             picture_Release(sys->asc.previous_picture);
++
++        /* A released surface control stays on screen as long as its parent does: take it out of
++         * the tree first, or its last picture shows wherever the next display does not cover it
++         * (after a format change and a rotation, a frozen strip beside the new picture). */
++        ASurfaceTransaction *txn = asc_api->ASurfaceTransaction.create();
++        if (txn != NULL)
++        {
++            asc_api->ASurfaceTransaction.reparent(txn, sys->asc.sc, NULL);
++            asc_api->ASurfaceTransaction.apply(txn);
++            asc_api->ASurfaceTransaction.delete(txn);
++        }
+         asc_api->ASurfaceControl.release(sys->asc.sc);
+     }
+ 
+diff --git a/modules/video_output/android/utils.c b/modules/video_output/android/utils.c
+index ef277c1..0077c74 100644
+--- a/modules/video_output/android/utils.c
++++ b/modules/video_output/android/utils.c
+@@ -467,6 +467,7 @@ LoadASurfaceControlAPI(AWindowHandler *p_awh, void *p_library)
+     LOAD(ASurfaceTransaction, apply);
+     LOAD(ASurfaceTransaction, setBuffer);
+     LOAD(ASurfaceTransaction, setVisibility);
++    LOAD(ASurfaceTransaction, reparent);
+     LOAD(ASurfaceTransaction, setBufferTransparency);
+     LOAD(ASurfaceTransaction, setBufferDataSpace);
+     LOAD(ASurfaceTransaction, setHdrMetadata_smpte2086);
+diff --git a/modules/video_output/android/utils.h b/modules/video_output/android/utils.h
+index 877e935..ac93189 100644
+--- a/modules/video_output/android/utils.h
++++ b/modules/video_output/android/utils.h
+@@ -92,6 +92,9 @@ typedef void (*pfn_ASurfaceTransaction_setBuffer)(
+ typedef void (*pfn_ASurfaceTransaction_setVisibility)(
+     ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+     int8_t visibility);
++typedef void (*pfn_ASurfaceTransaction_reparent)(
++    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
++    ASurfaceControl *new_parent);
+ typedef void (*pfn_ASurfaceTransaction_setBufferTransparency)(
+     ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+     int8_t transparency);
+@@ -162,6 +165,7 @@ struct asurface_control_api
+         pfn_ASurfaceTransaction_apply apply;
+         pfn_ASurfaceTransaction_setBuffer setBuffer;
+         pfn_ASurfaceTransaction_setVisibility setVisibility;
++        pfn_ASurfaceTransaction_reparent reparent;
+         pfn_ASurfaceTransaction_setBufferTransparency setBufferTransparency;
+         pfn_ASurfaceTransaction_setBufferDataSpace setBufferDataSpace;
+         pfn_ASurfaceTransaction_setHdrMetadata_smpte2086 setHdrMetadata_smpte2086;
+-- 
+2.54.0 (Apple Git-157)
+

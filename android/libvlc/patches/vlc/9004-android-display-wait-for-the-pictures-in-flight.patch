@@ -1,0 +1,222 @@
+From 831ab80d652410759c15b462fe7f4a3207902167 Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9004-android-display-wait-in-flight@localhost>
+From: Cobi Player <build@localhost>
+Date: Wed, 18 Nov 2026 23:55:29 +0100
+Subject: [PATCH] android: display: Close waits for the pictures still in a
+ surface transaction
+
+From Android 10 the display hands each frame to a surface transaction and
+lets go of the previous picture in the transaction's completion callback,
+ASC_OnComplete, on a binder thread. The callback reads the video window's
+function tables (avctx->asc_api; releasing the picture calls air_api's
+AImage functions), which live in the window's AWindowHandler. Close did not
+wait for those callbacks, and the window goes right after Close
+(libvlc_media_player_release: vout_Release frees it). A callback that came
+later called through freed memory: Cobi Player's native crash on close
+(SIGSEGV in ASC_OnComplete under TransactionCompletedListener::
+onTransactionCompleted, 15.11.2026). Callbacks come late whenever the app's
+one transaction listener is busy: the binder delivers its calls one at a
+time.
+
+- PrepareWithASC hands the callback a small heap context (the display's
+  sys and the picture) and counts the transactions in flight.
+- ASC_OnComplete does its work under a lock, counts down and wakes Close.
+- Close, after patch 9001's reparent-to-NULL transaction, waits until no
+  picture is in a transaction, at most ASC_CLOSE_TIMEOUT (1 s). On a time-out
+  it logs an error, marks the display abandoned (a late callback then leaks
+  its picture instead of reaching into the window) and leaks sys, which
+  the late callbacks still count down. A leaked picture also keeps its
+  video context, so the decoder's AImageReader and its buffers leak too:
+  freeing them later would call into the freed window as well.
+
+Not upstream: VLC master (2e9a78d148, 18.11.2026) still lets go of the
+picture without a wait.
+---
+ modules/video_output/android/display.c | 120 ++++++++++++++++++++-----
+ 1 file changed, 99 insertions(+), 21 deletions(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index 56fd26e8ac..eefe43c690 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -132,9 +132,29 @@ struct sys
+     struct {
+         ASurfaceControl *sc;
+         picture_t *previous_picture;
++        /* Pictures handed to a transaction whose completion callback has not
++         * run yet. The callback reads the video window's function tables,
++         * which go with the window after Close: Close waits for them. */
++        vlc_mutex_t lock;
++        vlc_cond_t idle;
++        unsigned in_flight;
++        /* Close stopped waiting: a late callback must not touch the window. */
++        bool abandoned;
+     } asc;
+ };
+ 
++/* How long Close waits for the pictures still in a transaction. They come back
++ * within a frame unless the app's transaction listener is held up. */
++#define ASC_CLOSE_TIMEOUT VLC_TICK_FROM_SEC(1)
++
++/* A transaction's completion context: the picture it lets go of, and the
++ * display that counts it. */
++struct asc_completion
++{
++    struct sys *sys;
++    picture_t *pic;
++};
++
+ static void subpicture_SetDisplaySize(vout_display_t *vd, unsigned width, unsigned height)
+ {
+     struct sys *sys = vd->sys;
+@@ -436,23 +456,38 @@ delete_win:
+ 
+ static void ASC_OnComplete(void *context, ASurfaceTransactionStats *stats)
+ {
+-    picture_t *pic = context;
+-    struct android_picture_ctx *apctx =
+-        container_of(pic->context, struct android_picture_ctx, s);
+-    vlc_video_context *vctx = picture_GetVideoContext(pic);
+-    assert(vctx != NULL);
+-    android_video_context_t *avctx =
+-        vlc_video_context_GetPrivate(vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+-
+-    /* See ASurfaceTransactionStats_getPreviousReleaseFenceFd documentation.
+-     * When buffer n is displayed, this callback is called with the n-1
+-     * picture, update the read fence fd from the previous transaction
+-     * (if valid = buffer not yet released) and release the VLC picture. */
+-    int release_fd =
+-        avctx->asc_api->ASurfaceTransactionStats.getPreviousReleaseFenceFd(stats, apctx->sc);
+-    if (release_fd >= 0)
+-        android_picture_ctx_set_read_fence(apctx, release_fd);
+-    picture_Release(pic);
++    struct asc_completion *completion = context;
++    struct sys *sys = completion->sys;
++    picture_t *pic = completion->pic;
++    free(completion);
++
++    /* Under the lock: Close cannot give up on this callback halfway. */
++    vlc_mutex_lock(&sys->asc.lock);
++    if (!sys->asc.abandoned)
++    {
++        struct android_picture_ctx *apctx =
++            container_of(pic->context, struct android_picture_ctx, s);
++        vlc_video_context *vctx = picture_GetVideoContext(pic);
++        assert(vctx != NULL);
++        android_video_context_t *avctx =
++            vlc_video_context_GetPrivate(vctx, VLC_VIDEO_CONTEXT_AWINDOW);
++
++        /* See ASurfaceTransactionStats_getPreviousReleaseFenceFd documentation.
++         * When buffer n is displayed, this callback is called with the n-1
++         * picture, update the read fence fd from the previous transaction
++         * (if valid = buffer not yet released) and release the VLC picture. */
++        int release_fd =
++            avctx->asc_api->ASurfaceTransactionStats.getPreviousReleaseFenceFd(stats, apctx->sc);
++        if (release_fd >= 0)
++            android_picture_ctx_set_read_fence(apctx, release_fd);
++        picture_Release(pic);
++    }
++    /* else the window may be gone, and with it the AImage functions that
++     * releasing the picture calls: the picture leaks instead. */
++
++    if (--sys->asc.in_flight == 0)
++        vlc_cond_signal(&sys->asc.idle);
++    vlc_mutex_unlock(&sys->asc.lock);
+ }
+ 
+ static void PrepareWithASC(vout_display_t *vd, picture_t *pic,
+@@ -476,16 +511,33 @@ static void PrepareWithASC(vout_display_t *vd, picture_t *pic,
+     }
+     assert(buffer != NULL);
+ 
++    struct asc_completion *completion = NULL;
++    if (sys->asc.previous_picture != NULL)
++    {
++        completion = malloc(sizeof (*completion));
++        if (unlikely(completion == NULL))
++            return; /* the previous picture stays on screen */
++    }
++
+     struct asurface_control_api *asc_api = sys->avctx->asc_api;
+     ASurfaceTransaction *txn = asc_api->ASurfaceTransaction.create();
+     if (txn == NULL)
++    {
++        free(completion);
+         return;
++    }
+ 
+-    if (sys->asc.previous_picture != NULL)
++    if (completion != NULL)
+     {
+-        asc_api->ASurfaceTransaction.setOnComplete(txn, sys->asc.previous_picture,
+-                                                   ASC_OnComplete);
++        completion->sys = sys;
++        completion->pic = sys->asc.previous_picture;
+         sys->asc.previous_picture = NULL;
++
++        vlc_mutex_lock(&sys->asc.lock);
++        sys->asc.in_flight++;
++        vlc_mutex_unlock(&sys->asc.lock);
++        asc_api->ASurfaceTransaction.setOnComplete(txn, completion,
++                                                   ASC_OnComplete);
+     }
+ 
+     int fence_fd = android_picture_ctx_get_fence_fd(apctx);
+@@ -623,6 +675,7 @@ static int AspectChanged(vout_display_t *vd, const video_format_t *source)
+ static void Close(vout_display_t *vd)
+ {
+     struct sys *sys = vd->sys;
++    bool leak = false;
+ 
+     if (sys->can_set_video_layout)
+         AWindowHandler_setVideoLayout(sys->awh, 0, 0, vd->place);
+@@ -644,13 +697,34 @@ static void Close(vout_display_t *vd)
+             asc_api->ASurfaceTransaction.apply(txn);
+             asc_api->ASurfaceTransaction.delete(txn);
+         }
++
++        /* The pictures still in a transaction come back in its completion
++         * callback, which reads the video window's function tables: the
++         * window goes after Close, so wait for them. */
++        vlc_tick_t deadline = vlc_tick_now() + ASC_CLOSE_TIMEOUT;
++        vlc_mutex_lock(&sys->asc.lock);
++        while (sys->asc.in_flight > 0
++            && vlc_cond_timedwait(&sys->asc.idle, &sys->asc.lock, deadline) == 0)
++            ;
++        unsigned left = sys->asc.in_flight;
++        sys->asc.abandoned = left > 0;
++        vlc_mutex_unlock(&sys->asc.lock);
++        if (left > 0)
++        {   /* Their callbacks still come, and still count down sys. */
++            msg_Err(vd, "%u picture(s) still in a surface transaction after "
++                        "%" PRId64 " ms: leaking them", left,
++                        MS_FROM_VLC_TICK(ASC_CLOSE_TIMEOUT));
++            leak = true;
++        }
++
+         asc_api->ASurfaceControl.release(sys->asc.sc);
+     }
+ 
+     if (sys->sub.window != NULL)
+         subpicture_CloseDisplay(vd);
+ 
+-    free(sys);
++    if (!leak)
++        free(sys);
+ }
+ 
+ static int CreateSurfaceControl(vout_display_t *vd)
+@@ -692,6 +766,10 @@ static int CreateSurfaceControl(vout_display_t *vd)
+ 
+     sys->asc.sc = sc;
+     sys->asc.previous_picture = NULL;
++    vlc_mutex_init(&sys->asc.lock);
++    vlc_cond_init(&sys->asc.idle);
++    sys->asc.in_flight = 0;
++    sys->asc.abandoned = false;
+ 
+     return VLC_SUCCESS;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

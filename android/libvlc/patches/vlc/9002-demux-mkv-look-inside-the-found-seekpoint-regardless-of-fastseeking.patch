@@ -1,0 +1,43 @@
+From 8414628dd4ddcafd5c6c60801a573a9b6c3d0e26 Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9002-mkv-seek-regardless-of-fastseek@localhost>
+From: Steve Lhomme <robux4@ycbcr.xyz>
+Date: Thu, 22 Oct 2026 14:30:05 +0200
+Subject: [PATCH] demux: mkv: look inside the found seekpoint regardless of
+ fastseeking
+
+For streams without fast seeking, the prefetch module hides (most) of the
+seeking/reading.
+
+Reverts commit 05e105ce4f0f64a8535c55be9e046c89c8d347ff.
+
+Fixes #30020
+
+Cobi Player: VLC master's 8414628d, backported unchanged to the VLC that
+libvlcjni a8d53a91 pins (c84ef1ed, which has 05e105ce but not its revert).
+Over HTTP every forward jump in an MKV landed on a cluster already read near
+the playing spot: without mkv_trusted the cues only count as questionable,
+and with the index check gated off for a stream that cannot fast-seek (HTTP
+never can), the seeker fell back to the last trusted point. Measured on the
+emulator, 11.11.2026: a jump from 0:07 to 5:00 asked for byte 841731 (0:10)
+instead of 26289754 (5:00). Drop this patch once the pinned VLC has 8414628d.
+---
+ modules/demux/mkv/matroska_segment_seeker.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/modules/demux/mkv/matroska_segment_seeker.cpp b/modules/demux/mkv/matroska_segment_seeker.cpp
+index ebf4d054124..09037244a6b 100644
+--- a/modules/demux/mkv/matroska_segment_seeker.cpp
++++ b/modules/demux/mkv/matroska_segment_seeker.cpp
+@@ -318,8 +318,7 @@ SegmentSeeker::get_seekpoints( matroska_segment_c& ms, vlc_tick_t target_pts,
+         if ( start.fpos == std::numeric_limits<fptr_t>::max() )
+             return tracks_seekpoint_t();
+
+-        if ( ms.sys.b_fastseekable &&
+-             (end.fpos != std::numeric_limits<fptr_t>::max() || !ms.b_cues) &&
++        if ( (end.fpos != std::numeric_limits<fptr_t>::max() || !ms.b_cues) &&
+              (needle_pts != start.pts || start.trust_level < Seekpoint::TRUSTED))
+             // do not read the whole (infinite?) file to get seek indexes
+             // do not generate an index if we already have the correct seekpoint
+--
+2.50.1
+

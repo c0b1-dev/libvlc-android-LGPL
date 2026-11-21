@@ -1,0 +1,67 @@
+From ea6a9ce6e0fa318ba025276003bf38128de5f2ad Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9006-mediacodec-window-gone@localhost>
+From: Cobi Player <build@localhost>
+Date: Fri, 20 Nov 2026 01:17:34 +0100
+Subject: [PATCH] mediacodec: a window gone as the decoder opens no longer
+ crashes it
+
+Before Android 10 (no ASurfaceControl, so no AImageReader) the decoder
+renders straight to the app's window: CreateSurface. When that window is
+gone as the decoder opens, CreateSurface releases the video context it has
+just created. The context's destroy, CleanFromLegacyVideoContext, takes the
+decoder from avctx->dec_opaque, which CreateSurface sets only once the
+surface is ready, and the context's memory comes from malloc: it locks a
+mutex through garbage. A SurfaceTexture that cannot be made takes the same
+path.
+
+Seen in Cobi Player on an Android 9 emulator: the app closed the player,
+its views detached, while the video decoder opened. "Could not find a valid
+ANativeWindow", then SIGSEGV in vlc_mutex_lock on the decoder's thread
+(fault addr 0x11e: dec_opaque held 0x2a, the lock is at 0xf0).
+
+- CreateSurface sets dec_opaque to NULL right after it creates the context.
+- CleanFromLegacyVideoContext returns when it finds no decoder: OpenDecoder's
+  bailout cleans the decoder itself, as before.
+- A debug line ("no surface: the video context goes before the decoder used
+  it") marks the error path and lets Cobi Player's package check see the
+  patch in the build.
+
+Nothing changes once the surface is ready. Not upstream: VLC master
+(9c35ded8, 19.11.2026) has the same CreateSurface and
+CleanFromLegacyVideoContext.
+---
+ modules/codec/omxil/mediacodec.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 4b8023d..6a15827 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -727,6 +727,9 @@ static void CleanFromLegacyVideoContext(void *priv)
+     android_video_context_t *avctx = priv;
+     decoder_sys_t *p_sys = avctx->dec_opaque;
+ 
++    if (p_sys == NULL)
++        return; /* CreateSurface failed: OpenDecoder's bailout cleans the decoder */
++
+     assert(!p_sys->video.use_air);
+ 
+     vlc_mutex_lock(&p_sys->lock);
+@@ -1036,6 +1039,9 @@ CreateSurface(decoder_t *p_dec, vlc_decoder_device *dec_dev,
+ 
+     android_video_context_t *avctx =
+         vlc_video_context_GetPrivate(p_sys->video.ctx, VLC_VIDEO_CONTEXT_AWINDOW);
++    /* The context's memory is not zeroed: until the surface is ready, its
++     * destroy must find no decoder to clean (the error path releases it). */
++    avctx->dec_opaque = NULL;
+ 
+     if (!use_surfacetexture)
+     {
+@@ -1081,6 +1087,7 @@ end:
+     return VLC_SUCCESS;
+ 
+ error:
++    msg_Dbg(p_dec, "no surface: the video context goes before the decoder used it");
+     vlc_video_context_Release(p_sys->video.ctx);
+     p_sys->video.ctx = NULL;
+     return VLC_EGENERIC;

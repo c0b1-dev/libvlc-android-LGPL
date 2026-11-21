@@ -1,0 +1,3 @@
+# build.sh: the libvlcjni + VLC trees and the built libraries (hours to rebuild, gigabytes)
+.build/
+out/

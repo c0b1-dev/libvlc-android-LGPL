@@ -1,0 +1,94 @@
+LGPL only: VLC's GPL-2+ modules and Lua stay out of libvlc.so, and the Lua scripts out of the package
+
+VLC's LGPL switch (`--license l`) picks the contribs; VLC's own modules are compiled whatever it
+says. A licence scan of every source file behind the package's module list (21.11.2026) found these
+GPL-2.0-or-later modules in libvlc.so: dummy (control/dummy.c), file_logger (logger/file.c), hqdn3d
+(video_filter/hqdn3d.h), rc (control/cli/), rotate (video_filter/rotate.c, control/motionlib.c),
+stream_out_cycle (stream_out/cycle.c), stream_out_rtp (stream_out/rtp.c), syslog (logger/syslog.c),
+and lua (all of modules/lua/). The package also carried VLC's Lua scripts as assets: 27 of its 29
+are GPL-2+, and only the lua module reads them.
+
+- build-libvlc.sh: `--disable-lua` in both lists (contribs, VLC's configure); the eight modules join
+  the module blacklist (sap is on it already).
+- libvlc/build.gradle: no Lua scripts copied into the package's assets (the HRTF file stays).
+
+Cobi Player uses none of them: it passes no option that names them, and plays direct stream URLs
+(no Lua playlist parser). Yadif, FFmpeg's GPL line filter inside the LGPL deinterlace plugin, goes
+with our VLC patch 9007. android/libvlc/check.sh refuses a package with any of it.
+
+--- a/buildsystem/build-libvlc.sh
++++ b/buildsystem/build-libvlc.sh
+@@ -301,7 +301,7 @@ VLC_CONTRIB_ARGS="\
+     --enable-libarchive \
+     --enable-libdsm \
+     --enable-libplacebo \
+-    --enable-lua \
++    --disable-lua \
+     --enable-microdns \
+     --enable-mpg123 \
+     --enable-nfs \
+@@ -361,7 +361,7 @@ VLC_CONFIGURE_ARGS="\
+     --enable-jpeg \
+     --enable-libass \
+     --enable-libxml2 \
+-    --enable-lua \
++    --disable-lua \
+     --enable-matroska \
+     --enable-mod \
+     --enable-mpg123 \
+@@ -431,6 +431,19 @@ VLC_MODULE_BLACKLIST="
+     yuv
+     .dummy
+ "
++# Cobi Player: VLC's GPL-2+ modules stay out, whatever the licence switch says: this libVLC
++# ships under the LGPL only. Lua (GPL-2+ too, and its scripts) is off in both configure lists.
++# sap is above already. Scripts/check-engine-gpl-free.sh refuses an engine with any of them.
++VLC_MODULE_BLACKLIST="${VLC_MODULE_BLACKLIST}
++    dummy
++    file_logger
++    hqdn3d
++    rc
++    rotate
++    stream_out_cycle
++    stream_out_rtp
++    syslog
++"
+ 
+ ###########################
+ # Build buildsystem tools #
+--- a/libvlc/build.gradle
++++ b/libvlc/build.gradle
+@@ -29,9 +29,6 @@ android {
+         tasks.whenTaskAdded { task ->
+             if (task.name.startsWith('merge')) {
+                 task.dependsOn hrtfsCopy
+-                task.dependsOn luaPlaylistCopy
+-                task.dependsOn luaMetaCopy
+-                task.dependsOn luaModuleCopy
+             }
+         }
+         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+@@ -74,23 +71,6 @@ android {
+         into 'assets/hrtfs'
+     }
+ 
+-    task luaPlaylistCopy(type: Copy) {
+-        from '../vlc/share/lua/playlist'
+-        into 'assets/lua/playlist'
+-        exclude '**/*.txt'
+-    }
+-
+-    task luaModuleCopy(type: Copy) {
+-        from '../vlc/share/lua/modules'
+-        into 'assets/lua/modules'
+-        exclude '**/*.txt'
+-    }
+-
+-    task luaMetaCopy(type: Copy) {
+-        from '../vlc/share/lua/meta'
+-        into 'assets/lua/meta'
+-        exclude '**/*.txt'
+-    }
+     buildFeatures {
+         buildConfig = true
+         resValues = true
