@@ -20,7 +20,8 @@
 #   6. libvlc.so carries the display's close fix (patches/vlc/9004): its time-out message;
 #   7. libvlc.so carries the adaptive stop fix (patches/vlc/9005): its debug line;
 #   8. libvlc.so carries the decoder's missing-window fix (patches/vlc/9006): its debug line;
-#   9. every library carries its symbol table (task 8.6): the app's build strips it from what ships
+#   9. libvlc.so carries the decoder's GPU-readable pictures (patches/vlc/9008): its debug line;
+#  10. every library carries its symbol table (task 8.6): the app's build strips it from what ships
 #      and puts it into the bundle, so Play Console names the functions in a native crash; locally,
 #      ndk-stack reads it from this package.
 # Needs `readelf` (binutils on Linux; on a Mac: READELF=<the NDK's llvm-readelf>).
@@ -94,6 +95,10 @@ for abi in $ABIS; do
   grep -qaF "no surface: the video context goes before the decoder used it" "$dir/libvlc.so" \
     || fail "$abi: libvlc.so lacks the decoder's missing-window fix (patches/vlc/9006) — closing the player can crash on Android 9."
   echo "  ✓ $abi: the decoder's missing-window fix (patches/vlc/9006)"
+
+  grep -qaF "AImageReader: pictures the GPU can read too" "$dir/libvlc.so" \
+    || fail "$abi: libvlc.so lacks the decoder's GPU-readable pictures (patches/vlc/9008) — picture-in-picture and rotations show black."
+  echo "  ✓ $abi: the decoder's GPU-readable pictures (patches/vlc/9008)"
 
   for lib in $LIBS; do
     # Read whole first: `grep -q` in a pipe can end readelf early, and pipefail would then refuse.

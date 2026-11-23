@@ -1,0 +1,60 @@
+From 973552fe26453e4c9954e596da12b2cd0d9f0e83 Mon Sep 17 00:00:00 2001
+Message-Id: <cobiplayer-9008-mediacodec-gpu-readable@localhost>
+From: Cobi Player <build@localhost>
+Date: Mon, 23 Nov 2026 15:32:07 +0100
+Subject: [PATCH] mediacodec: the GPU can read the decoder's pictures
+
+Since Android 12 the decoder hands its pictures to an AImageReader and the
+display puts them on a surface control of its own. The reader asked for no
+usage unless VLC draws with OpenGL, so the GPU could not read the buffers.
+SurfaceFlinger shows such a layer only through the display hardware: when
+it composes on the GPU, it draws the layer black ("vlc_video_control is
+blacked out as buffer is not gpu readable").
+
+It composes on the GPU more often than one would think: a picture-in-picture
+window (rounded corners and a shadow), the rotation animation, screenshots
+and screen recordings. Seen in Cobi Player on a Pixel 4 (Android 13): the
+picture-in-picture window stayed black while the sound played, and the
+picture went black during each rotation.
+
+- The reader always asks for AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE, as a
+  SurfaceView's own buffers do; the display hardware still takes them.
+- A debug line ("AImageReader: pictures the GPU can read too") lets Cobi
+  Player's package check see the patch in the build.
+
+Not upstream: VLC master (23.11.2026) asks for the usage only with need_gpu.
+---
+ modules/codec/omxil/mediacodec.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 6a15827..c350d25 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -958,8 +958,13 @@ CreateSurfaceFromAImageReader(decoder_t *p_dec, vlc_decoder_device *dec_dev,
+     uint64_t usage = 0;
+     int32_t max_images = 32;
+ 
+-    if (need_gpu)
+-        usage |= AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
++    /* Readable by the GPU always, not only when VLC draws the pictures with
++     * OpenGL (need_gpu): SurfaceFlinger composes on the GPU whenever the
++     * display hardware cannot (a picture-in-picture window's rounded corners,
++     * a rotation, a screenshot, a screen recording), and draws a layer whose
++     * buffers the GPU cannot read as black. */
++    VLC_UNUSED(need_gpu);
++    usage |= AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+ 
+     AImageReader *reader;
+     int32_t status = air_api->AImageReader.newWithUsage(width, height, format,
+@@ -971,6 +976,7 @@ CreateSurfaceFromAImageReader(decoder_t *p_dec, vlc_decoder_device *dec_dev,
+         msg_Warn(p_dec, "AImageReader_newWithUsage failed: %d", status);
+         return VLC_EGENERIC;
+     }
++    msg_Dbg(p_dec, "AImageReader: pictures the GPU can read too");
+ 
+     ANativeWindow *window;
+     status = air_api->AImageReader.getWindow(reader, &window);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -40,6 +40,7 @@ good() {
     echo "%u picture(s) still in a surface transaction after %ld ms: leaking them" >> "$work/pkg/jni/$abi/libvlc.so"
     echo "stopping: ending the downloads in progress" >> "$work/pkg/jni/$abi/libvlc.so"
     echo "no surface: the video context goes before the decoder used it" >> "$work/pkg/jni/$abi/libvlc.so"
+    echo "AImageReader: pictures the GPU can read too" >> "$work/pkg/jni/$abi/libvlc.so"
     echo "Java_org_videolan_libvlc_LibVLC_nativeNew" > "$work/pkg/jni/$abi/libvlcjni.so"
     echo "std::__ndk1::basic_string" > "$work/pkg/jni/$abi/libc++_shared.so"
   done
@@ -96,6 +97,7 @@ good; grep -v cobiplayer.proxy "$arm64/libvlc.so" > "$work/libvlc.so" && mv "$wo
 good; grep -v "surface transaction" "$arm64/libvlc.so" > "$work/libvlc.so" && mv "$work/libvlc.so" "$arm64/libvlc.so"; expect "lacks the display's close fix" "an engine built without the display's close fix"
 good; grep -v "ending the downloads" "$arm32/libvlc.so" > "$work/libvlc.so" && mv "$work/libvlc.so" "$arm32/libvlc.so"; expect "lacks the adaptive stop fix" "an engine built without the adaptive stop fix, 32-bit"
 good; grep -v "no surface" "$arm64/libvlc.so" > "$work/libvlc.so" && mv "$work/libvlc.so" "$arm64/libvlc.so"; expect "lacks the decoder's missing-window fix" "an engine built without the decoder's missing-window fix"
+good; grep -v "GPU can read" "$arm32/libvlc.so" > "$work/libvlc.so" && mv "$work/libvlc.so" "$arm32/libvlc.so"; expect "lacks the decoder's GPU-readable pictures" "an engine built without the decoder's GPU-readable pictures, 32-bit"
 good; echo STRIPPED >> "$arm64/libvlc.so"; expect "libvlc.so carries no symbol table" "a stripped engine (bare addresses in crash traces)"
 good; echo STRIPPED >> "$arm32/libvlcjni.so"; expect "libvlcjni.so carries no symbol table" "stripped bindings, 32-bit"
 
