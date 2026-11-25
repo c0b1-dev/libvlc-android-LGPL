@@ -29,15 +29,8 @@ Licence texts: [GNU LGPL 3](https://www.gnu.org/licenses/lgpl-3.0.html) ·
 
 ## Which version of the app ships which build
 
-Each app release has a tag here, at the state of this folder that built the libVLC it ships.
-
-| Tag | Cobi Player for Android | libVLC package (sha256) |
-| --- | --- | --- |
-| `v1.5.1-code1` | 1.5.1, version code 1 | `585f597d1e09c293d3f1aeadd9cf54b19ff61c6e80e3b4e7903e9e40db5ac24b` |
-| `v1.5.1-code2` | 1.5.1, version code 2 | `8fdb55928e093a6a277f0b32a334b0eea5d1661d7740d6493e8716b3a81bf9bc` |
-| `v1.5.1-code3` | 1.5.1, version code 3 | `8fdb55928e093a6a277f0b32a334b0eea5d1661d7740d6493e8716b3a81bf9bc` |
-
-`main` is the state the next release will be built from.
+Each release of the app has a tag here, `v<version>-code<version code>` (`v1.5.1-code3`: version 1.5.1, version
+code 3), at the state of this folder that built the libVLC that release ships. `main` is the state the next release will be built from.
 
 ## Building it
 
