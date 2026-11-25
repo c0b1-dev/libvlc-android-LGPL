@@ -23,7 +23,9 @@
 #   9. libvlc.so carries the decoder's GPU-readable pictures (patches/vlc/9008): its debug line;
 #  10. every library carries its symbol table (task 8.6): the app's build strips it from what ships
 #      and puts it into the bundle, so Play Console names the functions in a native crash; locally,
-#      ndk-stack reads it from this package.
+#      ndk-stack reads it from this package;
+#  11. the package carries the licences of the code built into libvlc.so, its contribs (licenses/, with
+#      FFmpeg's and GnuTLS's at least; build.sh's collect_licences): the app's licences page shows them.
 # Needs `readelf` (binutils on Linux; on a Mac: READELF=<the NDK's llvm-readelf>).
 # Held by check-test.sh.
 
@@ -44,6 +46,10 @@ unzip -q "$1" -d "$work"
 
 [ ! -e "$work/assets/lua" ] \
   || fail "the package carries VLC's Lua scripts (assets/lua: mostly GPL-2+, read only by the GPL lua module; patches/libvlcjni/0002 leaves them out)."
+
+[ -f "$work/licenses/MISSING" ] && [ -d "$work/licenses/ffmpeg" ] && [ -d "$work/licenses/gnutls" ] \
+  || fail "the package carries no licences of the code built into libvlc.so (licenses/ with FFmpeg's and GnuTLS's: build.sh collect_licences)."
+echo "  ✓ the licences of $(find "$work/licenses" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') contribs (licenses/)"
 
 for dir in "$work"/jni/*/; do
   abi=$(basename "$dir")

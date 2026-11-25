@@ -44,6 +44,10 @@ good() {
     echo "Java_org_videolan_libvlc_LibVLC_nativeNew" > "$work/pkg/jni/$abi/libvlcjni.so"
     echo "std::__ndk1::basic_string" > "$work/pkg/jni/$abi/libc++_shared.so"
   done
+  mkdir -p "$work/pkg/licenses/ffmpeg" "$work/pkg/licenses/gnutls"
+  echo "GNU LESSER GENERAL PUBLIC LICENSE" > "$work/pkg/licenses/ffmpeg/COPYING.LGPLv2.1"
+  echo "GNU LESSER GENERAL PUBLIC LICENSE" > "$work/pkg/licenses/gnutls/COPYING.LESSERv2"
+  echo "sqlite" > "$work/pkg/licenses/MISSING"
 }
 
 failures=0
@@ -65,6 +69,8 @@ arm64=$work/pkg/jni/arm64-v8a
 arm32=$work/pkg/jni/armeabi-v7a
 good; expect pass "a package as the build makes it passes"
 good; rm "$arm64/libvlcjni.so"; expect "libvlcjni.so missing" "a missing library"
+good; rm -r "$work/pkg/licenses"; expect "no licences of the code built into libvlc.so" "a package without the contribs' licences"
+good; rm -r "$work/pkg/licenses/gnutls"; expect "no licences of the code built into libvlc.so" "the contribs' licences without GnuTLS's"
 good; echo ALIGNED-4K >> "$arm64/libc++_shared.so"; expect "not 16 KB" "a 64-bit library aligned to 4 KB"
 good; echo "no engine here" > "$arm64/libvlc.so"; expect "configure line" "no engine's configure line"
 good; echo "'--enable-gpl'" >> "$arm64/libvlc.so"; expect "--enable-gpl" "an engine configured with --enable-gpl"

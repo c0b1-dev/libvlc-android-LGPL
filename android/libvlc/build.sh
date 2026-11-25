@@ -16,6 +16,7 @@
 #   - our fixes to libvlcjni (patches/libvlcjni/) and to VLC (patches/vlc/), each with its
 #     reason in its header;
 #   - libvlc.so and libvlcjni.so with their symbol table, for crash traces (see natives());
+#   - the licences of the code built into libvlc.so, in the package's licenses/ (collect_licences);
 #   - the checks that nothing of zvbi was built and that the VLC has the MP4 seek fix.
 
 set -euo pipefail
@@ -69,6 +70,39 @@ keep_zvbi_out() {
   [ "$(grep -c -- '--disable-zvbi \\$' "$script")" -eq 2 ] || fail "zvbi could not be switched off in build-libvlc.sh."
 }
 
+# The licences of the code VLC's build compiles for libvlc.so, its contribs (BSD, MIT, LGPL … — every package it
+# built, a few build-only ones among them), as their sources carry them at their top:
+# out/licenses-<abi>/<package>/<file>, and out/licenses-<abi>/MISSING naming a package without such a file. aar()
+# puts them into the package's licenses/; Scripts/gen-android-notices.py shows them on the app's licences page and
+# refuses a package listed in MISSING that it has no text for. (The package's other file of VLC, its HRTF in
+# assets/hrtfs, is VLC's own, under VLC's LGPL 2.1+: VLC commit 387c991a.)
+collect_licences() {
+  local abi=$1 vlc=$2 contrib dir file files licences
+  licences="$out/licenses-$abi"
+  contrib=$(find "$vlc/contrib" -mindepth 1 -maxdepth 1 -type d -name 'contrib-android-*')
+  [ -n "$contrib" ] && [ "$(wc -l <<<"$contrib")" -eq 1 ] \
+    || fail "expected one contrib-android-* folder under $vlc/contrib, found: ${contrib:-none}."
+  rm -rf "$licences"
+  mkdir -p "$licences"
+  : > "$licences/MISSING"
+  for dir in "$contrib"/*/; do
+    # COPYING, COPYING.LIB, COPYINGv3, LICENSE.md, LICENCE-BSD.txt, Copyright, NOTICE …; not glslang's
+    # license-checker.cfg nor a script.
+    files=$(find "$dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) | grep -iE '/(copying|licen[cs]e|copyright|notice|unlicense)[^/]*$' \
+      | grep -viE '\.(cfg|py|sh|json|ya?ml|in|am|ac|c|h|cmake)$' || true)
+    if [ -z "$files" ]; then
+      basename "$dir" >> "$licences/MISSING"
+      continue
+    fi
+    mkdir -p "$licences/$(basename "$dir")"
+    while IFS= read -r file; do cp "$file" "$licences/$(basename "$dir")/"; done <<<"$files"
+  done
+  # As with zvbi: a search that finds nothing proves nothing. FFmpeg's and GnuTLS's must be there.
+  [ -d "$licences/ffmpeg" ] && [ -d "$licences/gnutls" ] \
+    || fail "no licence of FFmpeg or GnuTLS under $contrib — the contribs are not where collect_licences looks."
+  echo "licences of $(find "$licences" -mindepth 1 -maxdepth 1 -type d | wc -l) contribs; without one: $(tr '\n' ' ' < "$licences/MISSING")"
+}
+
 natives() {
   local abi=$1
   case " $ABIS " in
@@ -99,6 +133,7 @@ natives() {
     fail "the zvbi module (GPL) is linked into libvlc.so for $abi."
   fi
   echo "$(wc -l < "$out/modules-$abi.txt") modules, none of them zvbi"
+  collect_licences "$abi" "$vlc"
 
   rm -rf "${out:?}/libs/$abi"
   mkdir -p "$out/libs/$abi"
@@ -129,7 +164,20 @@ aar() {
   built=$(find "$work/libvlcjni/libvlc/build/outputs/aar" -name '*.aar' | head -1)
   [ -n "$built" ] || fail "gradle built no .aar."
   cp "$built" "$out/libvlc.aar"
-  echo "$(basename "$built") → $out/libvlc.aar"
+  # The contribs' licences of every ABI (natives' collect_licences), one folder each: the same sources for both.
+  rm -rf "$out/licenses"
+  mkdir -p "$out/licenses"
+  for abi in $ABIS; do
+    [ -f "$out/licenses-$abi/MISSING" ] || fail "no $out/licenses-$abi — its natives ran without collect_licences."
+    cp -R "$out/licenses-$abi/." "$out/licenses/"
+  done
+  sort -u "$out"/licenses-*/MISSING > "$out/licenses/MISSING"
+  # Beside the package's own files; the app's build reads them from the package, nothing of them ships.
+  (cd "$out" && python3 -c 'import sys, zipfile, pathlib
+with zipfile.ZipFile(sys.argv[1], "a", zipfile.ZIP_DEFLATED) as z:
+    for f in sorted(pathlib.Path("licenses").rglob("*")):
+        if f.is_file(): z.write(f)' libvlc.aar)
+  echo "$(basename "$built") → $out/libvlc.aar, with the licences of $(find "$out/licenses" -mindepth 1 -maxdepth 1 -type d | wc -l) contribs"
 }
 
 case "${1:-}" in
